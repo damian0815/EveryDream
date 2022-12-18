@@ -57,7 +57,7 @@ class ImageView(tk.Frame):
         
         # caption field
         self.caption_frame = tk.Frame(self)
-        self.caption_field = tk.Text(self.caption_frame, wrap="word", width=50)
+        self.caption_field = tk.Text(self.caption_frame, wrap="word", width=50, undo=True, autoseparators=True)
         self.caption_field.pack(expand=True, fill=tk.BOTH)
         self.caption_frame.pack(fill=tk.Y, side=tk.RIGHT)
 
@@ -126,6 +126,7 @@ class ImageView(tk.Frame):
         # caption
         self.caption_field.delete(1.0, tk.END)
         self.caption_field.insert(tk.END, img.read_caption())
+        self.caption_field.edit_reset()
         # image
         img = Image.open(self.images[self.index].path)
         
