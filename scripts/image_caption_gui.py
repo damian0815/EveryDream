@@ -9,8 +9,18 @@
 
 import sys
 import tkinter as tk
+import traceback
+from random import random
 from tkinter import filedialog
+from typing import Generator
+
 from PIL import Image, ImageTk
+
+# enchant needs PYENCHANT_LIBRARY_PATH=/opt/homebrew/lib/libenchant-2.2.dylib
+import os
+os.environ["PYENCHANT_LIBRARY_PATH"]="/opt/homebrew/lib/libenchant-2.2.dylib"
+from enchant import Dict, tokenize
+
 from pathlib import Path
 
 IMG_EXT = ["jpg", "jpeg", "png"]
@@ -39,6 +49,76 @@ class CaptionedImage():
     def __lt__(self, other):
         return str(self.path).lower() < str(other.path).lower()
 
+# adapted from https://stackoverflow.com/a/66281314
+class SpellcheckText(tk.Text):
+    locale = 'en_US'
+    def __init__(self, master, **kwargs):
+        self.afterid = None
+        self.corpus = Dict(self.locale)
+        self.tokenize = tokenize.get_tokenizer(self.locale)
+        super(SpellcheckText, self).__init__(master, **kwargs)
+        self._proxy = self._w + "_proxy"
+        self.tk.call("rename", self._w, self._proxy)
+        self.tk.createcommand(self._w, self._proxycmd)
+        self.tag_configure('sic', foreground='red')
+        self.bind('<<TextModified>>', self.on_modify)
+
+    def _proxycmd(self, command, *args):
+        """Intercept the Tk commands to the text widget and if eny of the content
+        modifying commands are called, post a TextModified event."""
+        # avoid error when copying
+        if command == 'get' \
+                and (args[0] == 'sel.first' and args[1] == 'sel.last') \
+                and not self.tag_ranges('sel'):
+            return
+
+        # avoid error when deleting
+        if command == 'delete'\
+                and (args[0] == 'sel.first' and args[1] == 'sel.last') \
+                and not self.tag_ranges('sel'):
+            return
+
+        cmd = (self._proxy, command)
+        if args:
+            cmd = cmd + args
+        try:
+            result = self.tk.call(cmd)
+        except tk.TclError:
+            traceback.print_exc()
+            return
+        if command in ('insert', 'delete', 'replace'):
+            self.event_generate('<<TextModified>>')
+        return result
+
+    def on_modify(self, event):
+        """Rate limit the spell-checking with a 500ms delay. If another modification
+        event comes in within this time, cancel the after call and re-schedule."""
+        try:
+            delay = 200 # ms
+            if self.afterid:
+                self.after_cancel(self.afterid)
+            self.afterid = self.after(delay, self.on_modified)
+        except Exception as e:
+            print(e)
+
+    def on_modified(self):
+        """Handle the spell check once modification pauses.
+        The tokenizer works on lines and yields a list of (word, column) pairs
+        So iterate over the words and set a sic tag on each spell check failed word."""
+        self.afterid = None
+        self.tag_remove('sic', '1.0', 'end')
+        num_lines = [int(val) for val in self.index("end").split(".")][0]
+        for line in range(1, num_lines):
+            data = self.get(f"{line}.0 linestart", f"{line}.0 lineend")
+            for word,pos in self.tokenize(data):
+                check = self.corpus.check(word)
+                #print(f"{word},{pos},{check}")
+                if not check:
+                    start = f"{line}.{pos}"
+                    end = f"{line}.{pos + len(word)}"
+                    self.tag_add("sic", start, end)
+
+
 class ImageView(tk.Frame):
 
     def __init__(self, root):
@@ -48,6 +128,7 @@ class ImageView(tk.Frame):
         self.base_path = None
         self.images = []
         self.index = 0
+        self.search_text = ''
 
         # image
         self.image_frame = tk.Frame(self)
@@ -57,7 +138,10 @@ class ImageView(tk.Frame):
         
         # caption field
         self.caption_frame = tk.Frame(self)
-        self.caption_field = tk.Text(self.caption_frame, wrap="word", width=50)
+        self.caption_field = SpellcheckText(
+            self.caption_frame, wrap="word", width=40,
+                                            font=('Courier', 16),
+                                            undo=True, autoseparators=True)
         self.caption_field.pack(expand=True, fill=tk.BOTH)
         self.caption_frame.pack(fill=tk.Y, side=tk.RIGHT)
 
@@ -69,12 +153,19 @@ class ImageView(tk.Frame):
         if self.base_path is None:
             return
         self.images.clear()
-        for ext in IMG_EXT:
-            for file in self.base_path.glob(f'*.{ext}'):
-                self.images.append(CaptionedImage(file))
+        for directory, _, filenames in os.walk(dir):
+            image_filenames = [f for f in filenames if os.path.splitext(f)[1] in IMG_EXT]
+            for filename in image_filenames:
+                self.images.append(CaptionedImage(Path(os.path.join(directory,filename))))
         self.images.sort()
         self.update_ui()
-    
+
+    def shuffle_images(self):
+        self.store_caption()
+        random.shuffle(self.images)
+        self.set_index(0)
+        self.update_ui()
+
     def store_caption(self):
         txt = self.caption_field.get(1.0, tk.END)
         txt = txt.replace('\r', '').replace('\n', '').strip()
@@ -124,8 +215,11 @@ class ImageView(tk.Frame):
         title = self.images[self.index].path.name if len(self.images) > 0 else ''
         self.root.title(title + f' ({self.index+1}/{len(self.images)})')
         # caption
+        self.caption_field.edit_reset()
+        self.caption_field.edit_modified()
         self.caption_field.delete(1.0, tk.END)
         self.caption_field.insert(tk.END, img.read_caption())
+        self.caption_field.edit_reset()
         # image
         img = Image.open(self.images[self.index].path)
         
@@ -137,7 +231,64 @@ class ImageView(tk.Frame):
         photoImage = ImageTk.PhotoImage(img)
         self.image_label.configure(image=photoImage)
         self.image_label.image = photoImage
-    
+
+    def open_find_ui(self, reverse=False):
+        title = "Find in captions"
+        prompt = "Enter a text string to find in captions:"
+        self.search_text = tk.simpledialog.askstring(title, prompt)
+        print("searching for", self.search_text)
+        if reverse:
+            self.find_prev()
+        else:
+            self.find_next()
+
+    def load_all_captions(self) -> Generator[str, None, None]:
+        for i in self.images:
+            yield i.read_caption()
+
+    def find_next(self):
+        if len(self.images) == 0:
+            return
+        if len(self.search_text) == 0:
+            self.open_find_ui()
+        else:
+            start_index = ((self.index+1) % len(self.images))
+            end_index = len(self.images)
+            self.find_next_internal(start_index, end_index, reverse=False)
+
+    def find_prev(self):
+        if len(self.images) == 0:
+            return
+        if len(self.search_text) == 0:
+            self.open_find_ui(reverse=True)
+        else:
+            # prev search is just a next search with the indices reversed
+            end_index = (self.index+len(self.images)-1) % len(self.images)
+            start_index = 0
+            self.find_next_internal(start_index, end_index, reverse=True)
+
+    def find_next_internal(self, start_index, end_index, reverse=False, wrap=True):
+        print(f"find_next_internal from {start_index} to {end_index}, reverse:{reverse}, wrap:{wrap}")
+        captions = list(self.load_all_captions())
+        if start_index >= end_index:
+            raise ValueError(f"start index {start_index} must be < end index {end_index}")
+        try:
+            print('searching ')
+            indices = range(start_index, end_index)
+            if reverse:
+                indices = reversed(indices)
+            next_index = next(i for i in indices if self.search_text in captions[i])
+            print(f"going to {next_index}")
+            self.go_to_image(next_index)
+        except StopIteration:
+            # loop, but don't loop forever
+            if wrap:
+                if reverse:
+                    self.find_next_internal(start_index=end_index, end_index=len(self.images), reverse=True, wrap=False)
+                else:
+                    self.find_next_internal(start_index=0, end_index=start_index, reverse=False, wrap=False)
+
+
 if __name__=='__main__':
     root = tk.Tk()
     root.geometry('1200x800')
@@ -145,8 +296,14 @@ if __name__=='__main__':
 
     if sys.platform == 'darwin':
         root.bind('<Command-o>', lambda e: view.open_folder())
+        root.bind('<Command-f>', lambda e: view.open_find_ui())
+        root.bind('<Command-g>', lambda e: view.find_next())
+        root.bind('<Command-h>', lambda e: view.find_prev())
     else:
         root.bind('<Control-o>', lambda e: view.open_folder())
+        root.bind('<Control-f>', lambda e: view.open_find_ui())
+        root.bind('<Control-g>', lambda e: view.find_next())
+        root.bind('<Control-h>', lambda e: view.find_prev())
     root.bind('<Escape>', lambda e: root.destroy())
     root.bind('<Prior>', lambda e: view.prev_image())
     root.bind('<Next>', lambda e: view.next_image())
@@ -155,6 +312,7 @@ if __name__=='__main__':
     root.bind('<Shift-Home>', lambda e: view.go_to_image(0))
     root.bind('<Shift-End>', lambda e: view.go_to_image(len(view.images) - 1))
     root.bind('<Shift-Delete>', lambda e: view.delete_image())
+    root.bind('<Command-l>', lambda e: view.shuffle_images())
 
     view = ImageView(root)
     view.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
